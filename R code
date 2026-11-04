@@ -1,0 +1,1340 @@
+# =====================================================================
+# Cohort-adjusted measurement of age heaping in repeated single-year
+# age distributions (Lexis model with smooth age, year, cohort and
+# terminal-digit effects)
+#
+# What the script does
+#   step01  download Eurostat population by single year of age
+#   step02  identifiability by observation design; classical Myers index
+#           and a first (least-squares) cohort-adjusted index for all units
+#   step03  least-squares index on ages 23-72; Figure 1
+#   step05  Poisson estimator, rank checks, alternative age ranges, Romania
+#           common years (preliminary), stability over time; Figure S1
+#   step06  score test, wild cluster bootstrap, test-based intervals, final
+#           application, simulation study, noise thresholds; Figure 2
+#   step07  robustness of the final estimator, digit effects; Figures 3, 4
+#           and S2
+#   step08  Romania table with the final procedure, two-way clustered score
+#           test and multiple testing, comparison on the same age range,
+#           check of Condition 2, data-driven spline flexibility, simulation
+#           with dependence and other digit patterns
+#   step09  decomposition of the classical-adjusted difference on the same
+#           age range; weak identification by spline flexibility
+#   (step04 of the development version was superseded and is not needed.)
+#
+# Outputs used in the article (all written to the output folder)
+#   Table 1   step06_table1_simulation.csv
+#   Table 2   step06_noise_thresholds.csv
+#   Table 3   step06_adjusted_index_final.csv (ten largest values)
+#   Table 4   step09_decomposition_summary.csv
+#   Table 5   step07_table_robustness.csv; least squares from
+#             step05_summary_poisson.csv; QAIC from step08_df_qaic_summary.csv
+#   Table S1  step02_identifiability.csv
+#   Table S2  step09_weak_identification_by_df.csv (see also
+#             step08_condition2_check.csv)
+#   Table S3  step06_sim_by_population.csv
+#   Table S4  step08_table_simulation.csv
+#   Table S5  step06_adjusted_index_final.csv; q-values (p_score_bh) from
+#             step08_units_inference.csv
+#   Table S6  step08_romania_common_years.csv
+#   Figure 1  step03_fig1_identifiability       Figure 2  step06_fig2_simulation
+#   Figure 3  step07_fig3_classical_vs_adjusted  Figure 4  step07_fig5_digit_effects
+#   Figure S1 step05_fig_diagnostics            Figure S2 step07_figS1_age_range
+#   Numbers quoted in the text: step06_summary_final.csv,
+#   step08_units_summary.csv (test rejections, false discovery rate),
+#   step05_age_ranges_summary.csv and step05_time_stability.csv.
+#   step07_fig4_turkiye and the "Turkiye NUTS2" row of
+#   step09_decomposition_summary.csv are additional outputs not used in
+#   the article.
+#
+# Requirements: R (>= 4.1) with the packages splines (base R) and MASS
+# (recommended package shipped with R); the eurostat package is used if
+# available (installed on demand). R version used for the published
+# results: xxx.
+#
+# Running the script: every analysis block is skipped when its output file
+# already exists, so the script can be re-run at any time; figures are
+# always redrawn from the saved results. A complete run from scratch takes
+# several hours, mostly for the simulations in step06 and step08, which save
+# their progress after each setting and resume after an interruption.
+# Monte Carlo quantities (bias corrections, intervals, bootstrap p-values,
+# simulation results) use fixed seeds; a fresh run reproduces the published
+# values up to Monte Carlo error.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 0. Settings: output folder (Route A / Route B)
+#    Edit the two paths below to point to your own working folder.
+# ---------------------------------------------------------------------
+base_A <- "C:/Users/Alper.Tosun/Desktop/cru130"            # Route A: first machine
+base_B <- "C:/Users/autos/OneDrive/Desktop/cru130"         # Route B: second machine
+base_dir <- if (dir.exists(base_A)) base_A else base_B     # use A if it exists, otherwise B
+if (!dir.exists(base_dir)) stop("Neither working folder was found; edit base_A / base_B.")
+out_dir <- file.path(base_dir, "paper_age")                # output folder (results are reused from here)
+if (!dir.exists(out_dir)) dir.create(out_dir)              # create it only if missing
+cat("Output folder:", out_dir, "\n")                       # show which folder is used
+
+set.seed(2026)                                             # global seed for reproducibility
+
+# ---------------------------------------------------------------------
+# 1. Myers' blended index
+# ---------------------------------------------------------------------
+myers_ages <- 10:89                                        # Myers uses ages 10-89 (starts 10 and 20)
+
+# Blending weight matrix: rows = terminal digits 0-9, columns = ages 10-89
+make_W <- function() {
+  W <- matrix(0, nrow = 10, ncol = length(myers_ages))     # empty 10 x 80 matrix
+  for (d in 0:9) {                                         # loop over terminal digits
+    a1 <- seq(10 + d, 79, by = 10)                         # ages ending in d, starting at 10 (up to 79)
+    a2 <- seq(20 + d, 89, by = 10)                         # ages ending in d, starting at 20 (up to 89)
+    W[d + 1, a1 - 9] <- W[d + 1, a1 - 9] + (d + 1)         # weight (d+1) for the first series
+    W[d + 1, a2 - 9] <- W[d + 1, a2 - 9] + (9 - d)         # weight (9-d) for the second series
+  }
+  W                                                        # return the matrix
+}
+W_myers <- make_W()                                        # build it once
+
+# Myers' blended index from counts at ages 10-89
+myers_index <- function(counts) {
+  b <- as.vector(W_myers %*% counts)                       # blended totals per terminal digit
+  share <- 100 * b / sum(b)                                # blended shares in percent
+  0.5 * sum(abs(share - 10))                               # Myers index = half sum of |share - 10|
+}
+
+# ---------------------------------------------------------------------
+# 2. Figure helper (PDF + 1600 dpi PNG, no titles) and colours
+# ---------------------------------------------------------------------
+save_fig <- function(name, draw, w = 7, h = 5) {
+  pdf(file.path(out_dir, paste0(name, ".pdf")), width = w, height = h)  # vector version
+  draw(); dev.off()
+  ok <- tryCatch({                                         # Route A: cairo PNG
+    png(file.path(out_dir, paste0(name, ".png")), width = w, height = h, units = "in",
+        res = 1600, type = "cairo"); draw(); dev.off(); TRUE
+  }, error = function(e) { try(dev.off(), silent = TRUE); FALSE })
+  if (!ok) {                                               # Route B: default PNG device
+    png(file.path(out_dir, paste0(name, ".png")), width = w, height = h, units = "in", res = 1600)
+    draw(); dev.off()
+  }
+}
+lvl_col <- c(country = "#c0392b", NUTS1 = "#2471a3", NUTS2 = "grey55")  # colours by unit level
+
+# =====================================================================
+# STEP 01  Eurostat data
+# =====================================================================
+# 3. Eurostat population by single year of age (countries + NUTS regions)
+#    Dataset demo_r_d2jan: population on 1 January by age, sex, NUTS 2 region
+#    (includes country, NUTS1 and NUTS2 levels; no registration needed)
+# ---------------------------------------------------------------------
+raw_rds <- file.path(out_dir, "step01_eurostat_raw.rds")   # saved copy, so we download only once
+
+read_eurostat_tsv <- function(path) {                      # parse Eurostat bulk TSV file
+  x <- read.delim(path, check.names = FALSE, stringsAsFactors = FALSE,
+                  na.strings = ":", colClasses = "character")  # read everything as text
+  key <- do.call(rbind, strsplit(x[[1]], ","))             # first column holds freq,unit,sex,age,geo
+  hdr <- strsplit(sub("\\\\.*$", "", names(x)[1]), ",")[[1]]  # names of those key fields
+  colnames(key) <- hdr
+  keep <- key[, "sex"] == "T"                              # both sexes only
+  key <- key[keep, , drop = FALSE]; x <- x[keep, -1, drop = FALSE]
+  yrs <- as.integer(trimws(names(x)))                      # year columns
+  out <- data.frame(geo = rep(key[, "geo"], times = length(yrs)),
+                    age = rep(key[, "age"], times = length(yrs)),
+                    year = rep(yrs, each = nrow(key)),
+                    value = as.numeric(gsub("[^0-9.]", "", unlist(x))),  # drop flags like "p", "e"
+                    stringsAsFactors = FALSE)
+  out[!is.na(out$value), ]                                 # drop missing cells
+}
+
+if (file.exists(raw_rds)) {
+  eu <- readRDS(raw_rds)                                   # reuse saved data, no new download
+} else {
+  options(timeout = 3600)                                  # allow a long download
+  eu <- NULL
+  # Route A: eurostat R package
+  eu <- tryCatch({
+    if (!requireNamespace("eurostat", quietly = TRUE)) install.packages("eurostat")  # install if missing
+    d <- eurostat::get_eurostat("demo_r_d2jan", time_format = "num", cache = FALSE)  # download dataset
+    tcol <- intersect(c("TIME_PERIOD", "time"), names(d))[1]   # year column name differs by version
+    d <- d[d$sex == "T", ]                                 # both sexes only
+    data.frame(geo = as.character(d$geo), age = as.character(d$age),
+               year = as.integer(d[[tcol]]), value = as.numeric(d$values),
+               stringsAsFactors = FALSE)
+  }, error = function(e) { message("Route A failed: ", conditionMessage(e)); NULL })
+  # Route B: direct bulk TSV download from Eurostat API
+  if (is.null(eu)) {
+    tsv_gz <- file.path(out_dir, "demo_r_d2jan.tsv.gz")
+    url_b <- paste0("https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/",
+                    "demo_r_d2jan?format=TSV&compressed=true")
+    eu <- tryCatch({
+      download.file(url_b, tsv_gz, mode = "wb")            # download compressed TSV
+      read_eurostat_tsv(gzfile(tsv_gz))                    # parse it
+    }, error = function(e) { message("Route B failed: ", conditionMessage(e)); NULL })
+  }
+  if (is.null(eu)) stop("Both Eurostat download routes failed. Check the internet connection.")
+  saveRDS(eu, raw_rds)                                     # save so next run skips the download
+}
+
+eu <- eu[!is.na(eu$value), ]                               # drop missing population values
+eu <- eu[grepl("^Y[0-9]+$", eu$age), ]                     # keep single-year ages (Y0..Y99)
+eu$age <- as.integer(sub("^Y", "", eu$age))                # "Y23" -> 23
+eu <- eu[eu$age %in% myers_ages, ]                         # ages 10-89 only
+eu$level <- c("country", "NUTS1", "NUTS2")[pmin(nchar(eu$geo) - 1, 3)]  # code length gives the level
+eu <- eu[nchar(eu$geo) <= 4 & !grepl("^(EU|EA|EFTA)", eu$geo), ]  # drop EU aggregates and odd codes
+eu$key <- paste(eu$geo, eu$year)                           # one series = one region-year
+ok <- tapply(eu$age, eu$key, function(a) length(unique(a)) == length(myers_ages))  # all 80 ages present?
+eu <- eu[eu$key %in% names(ok)[ok], ]                      # keep complete series only
+cat("Unit-year series with complete single ages 10-89:", length(unique(eu$key)), "\n")
+
+# =====================================================================
+# STEP 02  Identifiability and first application
+# =====================================================================
+suppressMessages(library(splines))                         # natural splines for the smooth age curve
+
+# ---------------------------------------------------------------------
+# 4. Helper objects and functions for the cohort-adjusted index
+# ---------------------------------------------------------------------
+A_digit <- outer(myers_ages %% 10, 0:9, "==") * 1          # 80 x 10 matrix: age -> its terminal digit
+W_digit <- W_myers %*% A_digit                             # blending applied to digit multipliers
+
+# Myers index of a flat reference population distorted only by digit factors
+digit_index <- function(dc) {                              # dc: 10 centred log digit effects
+  f <- exp(as.matrix(dc))                                  # multiplicative digit factors (10 x k)
+  b <- W_digit %*% f                                       # blended totals per digit
+  sh <- 100 * sweep(b, 2, colSums(b), "/")                 # blended shares in percent
+  0.5 * colSums(abs(sh - 10))                              # one index value per column
+}
+
+# Fit the Lexis model for one region: log N(a,t) = smooth age + year + cohort + digit
+fit_digit_model <- function(s, df_age = 8) {
+  s$cohort <- s$year - s$age                               # birth year of each cell
+  s$digit  <- factor(s$age %% 10, levels = 0:9)            # terminal digit of age
+  fit <- tryCatch(                                         # Route A: least squares on log counts
+    lm(log(value + 0.5) ~ ns(age, df = df_age) + factor(year) + factor(cohort) + digit, data = s),
+    error = function(e) NULL)
+  if (is.null(fit))                                        # Route B: quasi-Poisson model on counts
+    fit <- tryCatch(glm(round(value) ~ ns(age, df = df_age) + factor(year) + factor(cohort) + digit,
+                        family = quasipoisson(), data = s), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  b <- coef(fit)[paste0("digit", 1:9)]                     # digit effects relative to digit 0
+  if (any(is.na(b))) return(list(identified = FALSE))      # digit effects not identifiable
+  keep <- !is.na(coef(fit))                                # drop aliased columns
+  X <- model.matrix(fit)[, keep, drop = FALSE]             # design matrix
+  e <- residuals(fit, type = "working")                    # residuals
+  bread <- solve(crossprod(X))                             # (X'X)^-1
+  meat  <- crossprod(rowsum(X * e, s$cohort))              # cohort-clustered score products
+  G <- length(unique(s$cohort))                            # number of cohort clusters
+  V <- (bread %*% meat %*% bread) * G / (G - 1)            # cluster-robust covariance
+  idx <- match(paste0("digit", 1:9), colnames(X))          # positions of digit effects
+  Vb <- V[idx, idx]                                        # covariance of digit effects
+  C <- rbind(0, diag(9)) - 1 / 10                          # map 9 contrasts to 10 centred effects
+  dc <- as.vector(C %*% b)                                 # centred digit effects
+  Vc <- C %*% Vb %*% t(C)                                  # their covariance
+  list(identified = TRUE, b = b, Vb = Vb, dc = dc, Vc = Vc)
+}
+
+# Index, noise floor, interval and test from a fitted model
+summarise_digit <- function(m, B = 1000) {
+  est <- digit_index(m$dc)                                 # estimated cohort-adjusted index
+  L <- tryCatch(t(chol(m$Vc + diag(1e-12, 10))), error = function(e) NULL)  # Cholesky factor
+  if (is.null(L)) {                                        # Route B: eigen square root
+    ev <- eigen(m$Vc, symmetric = TRUE)
+    L <- ev$vectors %*% diag(sqrt(pmax(ev$values, 0)))
+  }
+  Z <- matrix(rnorm(10 * B), 10, B)                        # standard normal draws
+  floor0 <- mean(digit_index(L %*% Z))                     # index expected from noise alone
+  draws  <- digit_index(m$dc + L %*% Z)                    # index around the estimate
+  wald <- as.numeric(t(m$b) %*% solve(m$Vb, m$b))          # Wald statistic, H0: no digit preference
+  bias <- mean(draws) - est                                # simulation estimate of the upward bias
+  q <- unname(quantile(draws, c(0.025, 0.975)))            # percentiles of the draws
+  c(index = est, noise_floor = floor0,
+    index_corrected = max(0, est - bias),                  # bias-corrected index
+    ci_low = max(0, 2 * est - q[2]),                       # basic simulation interval, lower
+    ci_high = max(0, 2 * est - q[1]),                      # basic simulation interval, upper
+    wald = wald, p_wald = pchisq(wald, df = 9, lower.tail = FALSE),
+    excess_digit0_pct = 100 * (exp(m$dc[1]) - 1),          # % excess at ages ending in 0
+    excess_digit5_pct = 100 * (exp(m$dc[6]) - 1))          # % excess at ages ending in 5
+}
+
+# Heaping generator with fractional shares (for simulation on expected counts)
+heap_counts <- function(x, h) {
+  new <- x
+  for (i in seq_along(myers_ages)) {
+    a <- myers_ages[i]; if (a %% 5 == 0) next              # ages ending in 0/5 stay
+    t <- round(a / 5) * 5; if (t > 89) t <- 85             # nearest multiple of 5 inside 10-89
+    k <- h * x[i]                                          # share h moves to the heaped age
+    new[i] <- new[i] - k; new[t - 9] <- new[t - 9] + k
+  }
+  new
+}
+
+# Eurostat data in long form, ages 10-89
+eu2 <- eu[, c("geo", "year", "age", "value", "level")]
+eu2 <- eu2[order(eu2$geo, eu2$year, eu2$age), ]
+# ---------------------------------------------------------------------
+# 5. Identifiability by observation design (rank of the design matrix;
+#    Table S1 and Figure 1)
+# ---------------------------------------------------------------------
+id_file <- file.path(out_dir, "step02_identifiability.csv")
+if (!file.exists(id_file)) {
+  designs <- list(annual = 2000:2009, biennial = seq(2000, 2018, 2), triennial = seq(2000, 2027, 3),
+                  quinquennial = seq(2000, 2020, 5), decennial = seq(2000, 2030, 10),
+                  mixed_5_6 = c(2000, 2005, 2011, 2016))   # observation-year designs
+  id_tab <- do.call(rbind, lapply(names(designs), function(nm) {
+    g <- expand.grid(age = myers_ages, year = designs[[nm]])  # Lexis grid
+    g$cohort <- g$year - g$age
+    X0 <- model.matrix(~ ns(age, 8) + factor(year) + factor(cohort), g)  # model without digits
+    D  <- model.matrix(~ factor(age %% 10), g)[, -1]       # 9 digit contrasts
+    r0 <- qr(X0)$rank
+    p05 <- as.numeric(g$age %% 5 == 0)                     # heaping on 0 and 5 equally
+    p0  <- as.numeric(g$age %% 10 == 0)                    # heaping on 0 only
+    p0v5 <- p0 - as.numeric(g$age %% 10 == 5)              # 0 versus 5 contrast
+    yr <- designs[[nm]]
+    data.frame(design = nm, years = paste(yr, collapse = " "),
+               gcd_with_10 = Reduce(function(a, b) { while (b) { t <- b; b <- a %% b; a <- t }; a },
+                                    c(diff(yr), 10)),      # gcd of year gaps and 10
+               identified_contrasts_of_9 = qr(cbind(X0, D))$rank - r0,
+               heaping_0_and_5_identified = (qr(cbind(X0, p05))$rank - r0) == 1,
+               heaping_0_only_identified = (qr(cbind(X0, p0))$rank - r0) == 1,
+               contrast_0_vs_5_identified = (qr(cbind(X0, p0v5))$rank - r0) == 1)
+  }))
+  write.csv(id_tab, id_file, row.names = FALSE)
+} else id_tab <- read.csv(id_file)
+print(id_tab)
+# ---------------------------------------------------------------------
+# 6. First application: least-squares index, ages 10-89, every unit
+#    (provides the unit list and the classical Myers index)
+# ---------------------------------------------------------------------
+app_file <- file.path(out_dir, "step02_adjusted_index.csv")
+if (!file.exists(app_file)) {
+  geos <- unique(eu2$geo); out <- list()
+  for (k in seq_along(geos)) {
+    set.seed(2026 + k)                                     # reproducible draws for each unit
+    s <- eu2[eu2$geo == geos[k], ]
+    yrs <- sort(unique(s$year))
+    if (length(yrs) < 8) next                              # need at least 8 annual distributions
+    if (sum(s$value) < 1000 * length(yrs)) next            # skip empty "extra-regio" units
+    m <- fit_digit_model(s)
+    if (is.null(m) || !m$identified) next
+    raw <- sapply(split(s$value, s$year), myers_index)     # classical Myers by year
+    r <- summarise_digit(m)
+    out[[geos[k]]] <- data.frame(geo = geos[k], level = s$level[1],
+      first_year = min(yrs), last_year = max(yrs), n_years = length(yrs),
+      mean_pop_10_89 = mean(tapply(s$value, s$year, sum)),
+      raw_myers_mean = mean(raw), raw_myers_sd = sd(raw), t(r),
+      share_raw_from_digits = min(1, r[["index_corrected"]] / mean(raw)))  # rest = cohort structure + noise
+    if (k %% 50 == 0) cat("Regions done:", k, "of", length(geos), "\n")
+  }
+  app <- do.call(rbind, out)
+  write.csv(app, app_file, row.names = FALSE)
+} else app <- read.csv(app_file)
+
+# =====================================================================
+# STEP 03  Least-squares index on ages 23-72 and Figure 1
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 7. Least-squares index on ages 23-72 (ages 10-89 let sharp young-adult
+#    migration peaks and the oldest ages leak into the digit effects)
+# ---------------------------------------------------------------------
+main_ages <- 23:72                                         # age range of the main analysis
+fit_unit <- function(g, ages = main_ages, df = 8, last_years = Inf, B = 1000) {
+  s <- eu2[eu2$geo == g & eu2$age %in% ages, ]             # ages of this analysis
+  yrs <- sort(unique(s$year))
+  s <- s[s$year %in% tail(yrs, min(length(yrs), last_years)), ]  # time window
+  m <- fit_digit_model(s, df_age = df)
+  if (is.null(m) || !m$identified) return(NULL)
+  r <- summarise_digit(m, B = B)
+  data.frame(geo = g, t(r))
+}
+
+app23_file <- file.path(out_dir, "step03_adjusted_index_ages23_72.csv")
+if (!file.exists(app23_file)) {
+  out <- lapply(seq_along(app$geo), function(k) {        # same units as step02
+    set.seed(2026 + k); fit_unit(app$geo[k]) })           # reproducible draws for each unit
+  app23 <- do.call(rbind, out)
+  base_cols <- app[, c("geo", "level", "first_year", "last_year", "n_years",
+                       "mean_pop_10_89", "raw_myers_mean", "raw_myers_sd")]
+  app23 <- merge(base_cols, app23, by = "geo")             # add unit information and classical Myers
+  app23$index_ages10_89 <- app$index_corrected[match(app23$geo, app$geo)]  # ages 10-89 value for comparison
+  write.csv(app23, app23_file, row.names = FALSE)
+} else app23 <- read.csv(app23_file)
+sel_geos <- c("FRY5", "RO", "TRA1", "NL11", "DE", "RO32")  # units shown in Figure 4
+
+# ---------------------------------------------------------------------
+# 8. Figure 1: identified digit contrasts by observation design
+# ---------------------------------------------------------------------
+design_lab <- c(annual = "Annual", biennial = "Biennial", triennial = "Triennial",
+                quinquennial = "Quinquennial", decennial = "Decennial",
+                mixed_5_6 = "Mixed (5 and 6 years)")       # readable design names
+save_fig("step03_fig1_identifiability", function() {
+  par(mar = c(4.5, 10, 3, 1), xpd = NA)                    # wide left margin, labels may leave the plot
+  d <- id_tab[nrow(id_tab):1, ]                            # first design at the top
+  cols <- ifelse(d$heaping_0_and_5_identified, "grey35", "grey80")  # dark = 0/5 heaping identified
+  bp <- barplot(d$identified_contrasts_of_9, names.arg = design_lab[d$design], horiz = TRUE,
+                las = 1, xlim = c(0, 9), col = cols, border = NA, axes = FALSE,
+                xlab = "Identified digit contrasts (out of 9)")
+  axis(1, at = 0:9)                                        # one tick per contrast
+  text(d$identified_contrasts_of_9 + 0.15, bp, d$identified_contrasts_of_9, adj = 0, cex = 0.85)  # value labels
+  legend("top", inset = c(0, -0.13), horiz = TRUE, bty = "n", cex = 0.8, border = NA,
+         legend = c("Equal 0 and 5 heaping identified", "Not identified"),
+         fill = c("grey35", "grey80"))                     # legend above the bars
+})
+cat("step01-03 finished.\n")
+
+# =====================================================================
+# STEP 05
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 9. Poisson log-linear estimator (replaces least squares on log counts)
+#     With year effects in the model, the Poisson fit is equivalent to a
+#     multinomial model for the age distribution of each year.
+# ---------------------------------------------------------------------
+fit_digit_pois <- function(s, df_age = 8) {
+  s$cohort <- s$year - s$age                               # birth year of each cell
+  s$digit  <- factor(s$age %% 10, levels = 0:9)            # terminal digit of age
+  form <- value ~ ns(age, df = df_age) + factor(year) + factor(cohort) + digit
+  fit <- tryCatch(                                         # Route A: quasi-Poisson GLM
+    suppressWarnings(glm(form, family = quasipoisson(), data = s,
+                         control = glm.control(maxit = 100))),
+    error = function(e) NULL)
+  if (is.null(fit) || !fit$converged)                      # Route B: Poisson GLM started from log counts
+    fit <- tryCatch(suppressWarnings(glm(form, family = poisson(), data = s,
+                         mustart = pmax(s$value, 1), control = glm.control(maxit = 200))),
+                    error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  b <- coef(fit)[paste0("digit", 1:9)]                     # digit effects relative to digit 0
+  if (any(is.na(b))) return(list(identified = FALSE))      # digit effects not identifiable
+  keep <- !is.na(coef(fit))                                # drop aliased columns
+  X  <- model.matrix(fit)[, keep, drop = FALSE]            # design matrix
+  mu <- fitted(fit)                                        # fitted counts
+  r  <- s$value - mu                                       # response residuals
+  bread <- solve(crossprod(X, X * mu))                     # (X' W X)^-1 for the log link
+  meat  <- crossprod(rowsum(X * r, s$cohort))              # cohort-clustered score products
+  G <- length(unique(s$cohort))                            # number of cohort clusters
+  V <- (bread %*% meat %*% bread) * G / (G - 1)            # cluster-robust covariance
+  idx <- match(paste0("digit", 1:9), colnames(X))
+  Vb <- V[idx, idx]
+  C <- rbind(0, diag(9)) - 1 / 10                          # 9 contrasts -> 10 centred effects
+  list(identified = TRUE, b = b, Vb = Vb, dc = as.vector(C %*% b), Vc = C %*% Vb %*% t(C),
+       fit = fit)
+}
+
+# Number of identified digit contrasts for the actual ages and years of a unit
+rank_digits <- function(s, df_age = 8) {
+  g <- unique(s[, c("age", "year")]); g$cohort <- g$year - g$age
+  X0 <- model.matrix(~ ns(age, df_age) + factor(year) + factor(cohort), g)
+  D  <- model.matrix(~ factor(age %% 10), g)[, -1]
+  qr(cbind(X0, D))$rank - qr(X0)$rank                      # 9 = all contrasts identified
+}
+
+fit_unit_pois <- function(g, ages = main_ages, df = 8, years = NULL, B = 1000) {
+  s <- eu2[eu2$geo == g & eu2$age %in% ages, ]
+  if (!is.null(years)) s <- s[s$year %in% years, ]         # optional subset of years
+  m <- fit_digit_pois(s, df_age = df)
+  if (is.null(m) || !m$identified) return(NULL)
+  r <- summarise_digit(m, B = B)
+  data.frame(geo = g, t(r))
+}
+
+# ---------------------------------------------------------------------
+# 10. Main application with the Poisson estimator (ages 23-72) + rank checks
+# ---------------------------------------------------------------------
+pois_file <- file.path(out_dir, "step05_adjusted_index_poisson.csv")
+if (!file.exists(pois_file)) {
+  out <- list()
+  for (k in seq_along(app23$geo)) {
+    set.seed(2026 + k)                                     # reproducible draws for each unit
+    g <- app23$geo[k]
+    r <- fit_unit_pois(g)
+    if (is.null(r)) next
+    r$identified_contrasts <- rank_digits(eu2[eu2$geo == g & eu2$age %in% main_ages, ])
+    out[[g]] <- r
+    if (k %% 50 == 0) cat("Poisson fits done:", k, "of", nrow(app23), "\n")
+  }
+  pois <- do.call(rbind, out)
+  pois <- merge(app23[, c("geo", "level", "first_year", "last_year", "n_years",
+                          "mean_pop_10_89", "raw_myers_mean")], pois, by = "geo")
+  pois$index_ols <- app23$index_corrected[match(pois$geo, app23$geo)]  # least-squares estimate for comparison
+  write.csv(pois, pois_file, row.names = FALSE)
+} else pois <- read.csv(pois_file)
+
+pois_sum <- do.call(rbind, lapply(split(pois, pois$level), function(d) data.frame(
+  level = d$level[1], n_units = nrow(d),
+  all_9_contrasts_identified = mean(d$identified_contrasts == 9),
+  median_classical = median(d$raw_myers_mean),
+  median_poisson = median(d$index_corrected), median_ols = median(d$index_ols),
+  spearman_poisson_vs_ols = cor(d$index_corrected, d$index_ols, method = "spearman"),
+  spearman_poisson_vs_classical = cor(d$index_corrected, d$raw_myers_mean, method = "spearman"),
+  share_poisson_below_0.1 = mean(d$index_corrected < 0.1),
+  share_wald_p_below_0.05 = mean(d$p_wald < 0.05))))
+write.csv(pois_sum, file.path(out_dir, "step05_summary_poisson.csv"), row.names = FALSE)
+print(pois_sum, row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 11. Alternative age ranges (Poisson; Table 5 and Figure S2)
+# ---------------------------------------------------------------------
+ages_file <- file.path(out_dir, "step05_age_ranges.csv")
+if (!file.exists(ages_file)) {
+  ranges <- list(ages20_79 = 20:79, ages25_69 = 25:69, ages30_79 = 30:79, ages10_89 = 10:89)
+  rows <- list()
+  for (rn in names(ranges)) {
+    d <- do.call(rbind, lapply(seq_along(pois$geo), function(k) {
+      set.seed(2026 + k)                                   # reproducible draws for each unit
+      fit_unit_pois(pois$geo[k], ages = ranges[[rn]], B = 300) }))
+    d$range <- rn
+    rows[[rn]] <- d[, c("range", "geo", "index_corrected", "p_wald")]
+    cat("Age range done:", rn, "\n")
+  }
+  ages_res <- do.call(rbind, rows)
+  write.csv(ages_res, ages_file, row.names = FALSE)
+} else ages_res <- read.csv(ages_file)
+
+ages_sum <- do.call(rbind, lapply(split(ages_res, ages_res$range), function(d) {
+  b <- pois$index_corrected[match(d$geo, pois$geo)]
+  data.frame(range = d$range[1], n_units = nrow(d),
+             spearman_with_23_72 = cor(d$index_corrected, b, method = "spearman"),
+             median_abs_change = median(abs(d$index_corrected - b)),
+             median_index = median(d$index_corrected),
+             top10_overlap = length(intersect(head(d$geo[order(-d$index_corrected)], 10),
+                                              head(pois$geo[order(-pois$index_corrected)], 10))) / 10)
+}))
+write.csv(ages_sum, file.path(out_dir, "step05_age_ranges_summary.csv"), row.names = FALSE)
+print(ages_sum, row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 12. Romania: national series restricted to the years of the regional series
+#     (preliminary version; Table S6 uses the final procedure in section 22)
+# ---------------------------------------------------------------------
+ro_file <- file.path(out_dir, "step05_romania_common_years.csv")
+if (!file.exists(ro_file)) {
+  yrs_nat <- sort(unique(eu2$year[eu2$geo == "RO"]))
+  yrs_reg <- sort(unique(eu2$year[eu2$geo == "RO32"]))     # regional years (same for all RO regions)
+  yrs_com <- intersect(yrs_nat, yrs_reg)
+  yrs_not <- setdiff(yrs_nat, yrs_reg)
+  set.seed(2026)                                           # reproducible draws
+  ro <- rbind(
+    cbind(series = "national, all years", n_years = length(yrs_nat), fit_unit_pois("RO")),
+    cbind(series = "national, regional years only", n_years = length(yrs_com),
+          fit_unit_pois("RO", years = yrs_com)),
+    if (length(yrs_not) >= 3) cbind(series = "national, years without regional data",
+          n_years = length(yrs_not), fit_unit_pois("RO", years = yrs_not)))
+  ro$years_used <- c(paste(range(yrs_nat), collapse = "-"), paste(yrs_com, collapse = " "),
+                     if (length(yrs_not) >= 3) paste(yrs_not, collapse = " "))[seq_len(nrow(ro))]
+  write.csv(ro, ro_file, row.names = FALSE)
+} else ro <- read.csv(ro_file)
+print(ro[, c("series", "n_years", "index_corrected", "ci_low", "ci_high", "p_wald")], row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 13. Stability of digit effects over time: first half vs second half
+#     (Section 3.4)
+# ---------------------------------------------------------------------
+half_file <- file.path(out_dir, "step05_time_stability.csv")
+if (!file.exists(half_file)) {
+  out <- list()
+  for (g in pois$geo[pois$n_years >= 16]) {                # units with at least 16 annual distributions
+    s <- eu2[eu2$geo == g & eu2$age %in% main_ages, ]
+    yrs <- sort(unique(s$year)); h1 <- yrs[seq_len(floor(length(yrs) / 2))]; h2 <- setdiff(yrs, h1)
+    m1 <- fit_digit_pois(s[s$year %in% h1, ]); m2 <- fit_digit_pois(s[s$year %in% h2, ])
+    if (is.null(m1) || is.null(m2) || !m1$identified || !m2$identified) next
+    d <- m1$b - m2$b                                       # change in the nine digit contrasts
+    w <- tryCatch(as.numeric(t(d) %*% solve(m1$Vb + m2$Vb, d)), error = function(e) NA)
+    out[[g]] <- data.frame(geo = g, first_half = paste(range(h1), collapse = "-"),
+                           second_half = paste(range(h2), collapse = "-"),
+                           index_first = digit_index(m1$dc), index_second = digit_index(m2$dc),
+                           wald_change = w, p_change = pchisq(w, 9, lower.tail = FALSE))
+  }
+  half <- do.call(rbind, out)
+  write.csv(half, half_file, row.names = FALSE)
+} else half <- read.csv(half_file)
+cat("Units tested for change over time:", nrow(half), "\n")
+cat("Share with significant change (p < 0.05):", round(mean(half$p_change < 0.05, na.rm = TRUE), 3), "\n")
+cat("Median |index first - index second|:", round(median(abs(half$index_first - half$index_second)), 3), "\n")
+print(half[half$geo %in% c("FRY5", "RO", "DE", "TR", "RO32"), ], row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 14. Figure S1: observed age distributions in Mayotte and Romania
+# ---------------------------------------------------------------------
+save_fig("step05_fig_diagnostics", function() {
+  par(mfrow = c(1, 2), mar = c(4.5, 5.5, 2, 0.5))
+  for (g in c("FRY5", "RO")) {
+    s <- eu2[eu2$geo == g & eu2$age %in% main_ages, ]
+    yrs <- sort(unique(s$year)); show <- yrs[round(seq(1, length(yrs), length.out = 4))]  # four years
+    cols <- c("#c0392b", "#d68910", "#2471a3", "#1e8449")
+    plot(NA, xlim = range(main_ages), ylim = range(s$value[s$year %in% show]) * c(0.9, 1.1),
+         log = "y", yaxt = "n", xlab = "Age", ylab = "", main = g, cex.main = 0.9)
+    at <- axTicks(2)                                       # tick positions on the log axis
+    axis(2, at = at, labels = format(at, big.mark = ",", scientific = FALSE, trim = TRUE),
+         las = 1, cex.axis = 0.75)                         # plain numbers instead of 4e+05
+    mtext("Population (log scale)", side = 2, line = 4.2)
+    abline(v = seq(30, 70, 10), col = "grey85", lty = 3)   # ages ending in 0
+    for (k in seq_along(show)) {
+      z <- s[s$year == show[k], ]; z <- z[order(z$age), ]
+      lines(z$age, z$value, col = cols[k], lwd = 1.2)
+    }
+    legend("bottomleft", legend = show, col = cols, lwd = 1.2, bty = "n", cex = 0.7)
+  }
+}, w = 9, h = 4)
+
+cat("step05 finished. Files are in:", out_dir, "\n")
+# =====================================================================
+# STEP 06  (long: the simulation takes several hours; it saves its
+#           progress after every setting and resumes where it stopped)
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 15. Fast fitting on a fixed design (the design is the same in every
+#     replication of a setting, so it is built only once)
+# ---------------------------------------------------------------------
+build_design <- function(ages, years, df_age = 8) {
+  g <- expand.grid(age = ages, year = sort(years))         # cells ordered by year, then age
+  g$cohort <- g$year - g$age
+  g$digit <- factor(g$age %% 10, levels = 0:9)
+  drop_aliased <- function(X) { q <- qr(X); X[, sort(q$pivot[seq_len(q$rank)]), drop = FALSE] }
+  X1 <- drop_aliased(model.matrix(~ ns(age, df_age) + factor(year) + factor(cohort) + digit, g))
+  X0 <- drop_aliased(model.matrix(~ ns(age, df_age) + factor(year) + factor(cohort), g))
+  dfy <- max(1, min(4, length(unique(g$year)) - 1))        # smooth year basis for the comparison model
+  XS <- drop_aliased(model.matrix(~ ns(age, df_age) * ns(year, dfy) + digit, g))  # smooth surface, no cohorts
+  D <- model.matrix(~ digit, g)[, -1]                      # nine digit contrasts
+  list(grid = g, X1 = X1, X0 = X0, XS = XS, D = D,
+       di1 = match(paste0("digit", 1:9), colnames(X1)), diS = match(paste0("digit", 1:9), colnames(XS)))
+}
+
+pois_fit <- function(y, X) {
+  f <- tryCatch(suppressWarnings(glm.fit(X, y, family = poisson(),  # Route A: default start
+                control = glm.control(maxit = 100))), error = function(e) NULL)
+  if (is.null(f) || !f$converged)                          # Route B: start from log counts
+    f <- tryCatch(suppressWarnings(glm.fit(X, y, family = poisson(), mustart = pmax(y, 1),
+                  control = glm.control(maxit = 300))), error = function(e) NULL)
+  f
+}
+
+# Full inference for one data vector y on design dz
+infer_digit <- function(y, dz, B_draw = 500, B_wild = 399) {
+  cl <- dz$grid$cohort
+  f1 <- pois_fit(y, dz$X1); f0 <- pois_fit(y, dz$X0)
+  if (is.null(f1) || is.null(f0)) return(NULL)
+  b <- f1$coefficients[dz$di1]
+  if (any(is.na(b))) return(NULL)
+  # (a) cluster-robust covariance of the digit effects at the unrestricted fit
+  mu <- f1$fitted.values; r <- y - mu; X <- dz$X1
+  bread <- chol2inv(chol(crossprod(X, X * mu)))
+  G <- length(unique(cl))
+  V <- bread %*% crossprod(rowsum(X * r, cl)) %*% bread * G / (G - 1)
+  Vb <- V[dz$di1, dz$di1]
+  C <- rbind(0, diag(9)) - 1 / 10
+  m <- list(b = b, Vb = Vb, dc = as.vector(C %*% b), Vc = C %*% Vb %*% t(C))
+  est <- summarise_digit(m, B = B_draw)                    # index, bias correction, basic interval
+  # (b) score test of no digit preference at the restricted fit, cohort clusters
+  mu0 <- f0$fitted.values; r0 <- y - mu0; X0 <- dz$X0
+  A <- solve(crossprod(X0, X0 * mu0), crossprod(X0, dz$D * mu0))
+  Dt <- dz$D - X0 %*% A                                    # digit columns purged of nuisance terms
+  Sc <- rowsum(Dt * r0, cl)                                # cluster scores
+  S <- colSums(Sc); Vs <- crossprod(Sc)
+  Vi <- tryCatch(solve(Vs), error = function(e) MASS::ginv(Vs))
+  T0 <- as.numeric(t(S) %*% Vi %*% S)
+  p_score <- pchisq(T0, 9, lower.tail = FALSE)
+  # (c) wild cluster bootstrap of the score statistic (Rademacher weights)
+  Wb <- matrix(sample(c(-1, 1), nrow(Sc) * B_wild, TRUE), nrow(Sc))
+  Sb <- crossprod(Sc, Wb)
+  p_wild <- (1 + sum(colSums(Sb * (Vi %*% Sb)) >= T0)) / (B_wild + 1)
+  # (d) test-based interval: lower limit is zero when no digit preference cannot be rejected
+  ci_low_tb <- if (p_score >= 0.05) 0 else est[["ci_low"]]
+  c(est, score = T0, p_score = p_score, p_wild = p_wild, ci_low_tb = ci_low_tb)
+}
+
+smooth_index <- function(y, dz) {                          # comparison: smooth latent surface, no cohorts
+  f <- pois_fit(y, dz$XS)
+  if (is.null(f)) return(NA)
+  b <- f$coefficients[dz$diS]
+  if (any(is.na(b))) return(NA)
+  digit_index(c(0, b) - mean(c(0, b)))
+}
+
+# ---------------------------------------------------------------------
+# 16. Final application: all 502 units with the score test and intervals
+#     (Table 3, Table S5 and the main results)
+# ---------------------------------------------------------------------
+final_file <- file.path(out_dir, "step06_adjusted_index_final.csv")
+if (!file.exists(final_file)) {
+  out <- list()
+  for (k in seq_along(pois$geo)) {
+    set.seed(2026 + k)                                     # reproducible draws for each unit
+    g <- pois$geo[k]
+    s <- eu2[eu2$geo == g & eu2$age %in% main_ages, ]
+    s <- s[order(s$year, s$age), ]
+    dz <- build_design(main_ages, unique(s$year))
+    r <- infer_digit(s$value, dz, B_draw = 1000, B_wild = 999)
+    if (is.null(r)) next
+    out[[g]] <- data.frame(geo = g, t(r), smooth_surface_index = smooth_index(s$value, dz))
+    if (k %% 50 == 0) cat("Final application:", k, "of", nrow(pois), "\n")
+  }
+  fin <- do.call(rbind, out)
+  fin <- merge(pois[, c("geo", "level", "first_year", "last_year", "n_years",
+                        "mean_pop_10_89", "raw_myers_mean")], fin, by = "geo")
+  write.csv(fin, final_file, row.names = FALSE)
+} else fin <- read.csv(final_file)
+
+fin_sum <- do.call(rbind, lapply(split(fin, fin$level), function(d) data.frame(
+  level = d$level[1], n_units = nrow(d),
+  median_classical = median(d$raw_myers_mean),
+  median_smooth_surface = median(d$smooth_surface_index, na.rm = TRUE),
+  median_adjusted = median(d$index_corrected),
+  share_adjusted_below_0.1 = mean(d$index_corrected < 0.1),
+  share_adjusted_above_0.5 = mean(d$index_corrected > 0.5),
+  share_score_p_below_0.05 = mean(d$p_score < 0.05),
+  share_wild_p_below_0.05 = mean(d$p_wild < 0.05),
+  spearman_classical_vs_adjusted = cor(d$raw_myers_mean, d$index_corrected, method = "spearman"))))
+write.csv(fin_sum, file.path(out_dir, "step06_summary_final.csv"), row.names = FALSE)
+print(fin_sum, row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 17. Simulation study (Poisson estimator, score test, smooth-surface comparison)
+#     The starting surface is the observed data of each population with the
+#     estimated digit factors removed; heaping is then added to it.
+#     Progress is appended to step06_sim_progress.csv after every setting.
+# ---------------------------------------------------------------------
+sim6_prog <- file.path(out_dir, "step06_sim_progress.csv")
+sim6_settings <- expand.grid(heaping = c(0, 0.01, 0.02, 0.05), n = c(2e4, 1e5, 1e6),
+                             n_years = c(8, 18), base = c("DE", "RO", "PL", "EL", "TR"),
+                             stringsAsFactors = FALSE)
+sim6_settings$R <- ifelse(sim6_settings$heaping <= 0.01, 1000, 300)  # more replications where size/coverage matter
+sim6_settings$id <- seq_len(nrow(sim6_settings))
+done_ids <- if (file.exists(sim6_prog)) read.csv(sim6_prog)$id else integer(0)
+todo <- sim6_settings[!sim6_settings$id %in% done_ids, ]
+cat("Simulation settings remaining:", nrow(todo), "of", nrow(sim6_settings), "\n")
+
+base_cache <- list()
+for (k in seq_len(nrow(todo))) {
+  st <- todo[k, ]
+  set.seed(2026 + st$id)                                   # reproducible, also after a restart
+  key <- paste(st$base, st$n_years)
+  if (is.null(base_cache[[key]])) {                        # cohort structure without digit preference
+    s_all <- eu2[eu2$geo == st$base & eu2$year >= 2008, ]
+    yrs <- tail(sort(unique(s_all$year)), st$n_years)
+    s0 <- s_all[s_all$year %in% yrs, ]; s0 <- s0[order(s0$year, s0$age), ]
+    m0 <- fit_digit_pois(s0[s0$age %in% main_ages, ])
+    s0$value <- s0$value * exp(-m0$dc[s0$age %% 10 + 1])
+    base_cache[[key]] <- list(s0 = s0, dz = build_design(main_ages, yrs))
+  }
+  s0 <- base_cache[[key]]$s0; dz <- base_cache[[key]]$dz
+  lam <- lapply(split(s0$value, s0$year), heap_counts, h = st$heaping)  # expected heaped counts per year
+  in_main <- myers_ages %in% main_ages
+  # estimand: index of the model fitted to the expected heaped counts (exactly 0 without heaping)
+  y_pop <- unlist(lapply(lam, function(v) v[in_main]))
+  target <- if (st$heaping == 0) 0 else {
+    f <- pois_fit(y_pop, dz$X1); digit_index(c(0, f$coefficients[dz$di1]) - mean(c(0, f$coefficients[dz$di1])))
+  }
+  res <- matrix(NA, st$R, 9)
+  for (r in seq_len(st$R)) {
+    smp <- lapply(lam, function(v) as.vector(rmultinom(1, st$n, v)))  # n persons aged 10-89 per year
+    raw <- mean(sapply(smp, myers_index))                  # classical Myers
+    y <- unlist(lapply(smp, function(v) v[in_main]))       # ages 23-72 for the models
+    a <- infer_digit(y, dz, B_draw = 300, B_wild = 199)
+    if (is.null(a)) next
+    res[r, ] <- c(raw, a[["index_corrected"]], a[["ci_low"]], a[["ci_high"]], a[["ci_low_tb"]],
+                  a[["p_score"]], a[["p_wild"]], 1 - pchisq(a[["wald"]], 9), smooth_index(y, dz))
+  }
+  ok <- !is.na(res[, 2])
+  row <- data.frame(id = st$id, base = st$base, n_years = st$n_years, n = st$n, heaping = st$heaping,
+    R = sum(ok), target = target,
+    classical_mean = mean(res[ok, 1]), smooth_mean = mean(res[ok, 9], na.rm = TRUE),
+    adjusted_mean = mean(res[ok, 2]), bias = mean(res[ok, 2]) - target,
+    rmse = sqrt(mean((res[ok, 2] - target)^2)),
+    smooth_bias = mean(res[ok, 9], na.rm = TRUE) - target,
+    coverage_basic = mean(res[ok, 3] <= target & target <= res[ok, 4]),
+    coverage_testbased = mean(res[ok, 5] <= target & target <= res[ok, 4]),
+    reject_score = mean(res[ok, 6] < 0.05), reject_wild = mean(res[ok, 7] < 0.05),
+    reject_wald = mean(res[ok, 8] < 0.05),
+    q95_adjusted = unname(quantile(res[ok, 2], 0.95)))    # noise threshold when heaping = 0
+  write.table(row, sim6_prog, sep = ",", row.names = FALSE,
+              col.names = !file.exists(sim6_prog), append = file.exists(sim6_prog))
+  cat(format(Sys.time(), "%H:%M"), "setting", st$id, "of", nrow(sim6_settings),
+      "done (", st$base, st$n_years, "years, n =", st$n, ", h =", st$heaping, ")\n")
+}
+
+# ---------------------------------------------------------------------
+# 18. Simulation tables (Tables 1 and S3), noise thresholds (Table 2) and
+#     Figure 2 (only when the simulation is complete)
+# ---------------------------------------------------------------------
+sim6 <- read.csv(sim6_prog)
+if (nrow(sim6) == nrow(sim6_settings)) {
+  write.csv(sim6[order(sim6$base, sim6$n_years, sim6$n, sim6$heaping), ],
+            file.path(out_dir, "step06_sim_by_population.csv"), row.names = FALSE)
+  rng <- function(x, d = 3) paste(format(round(min(x), d), nsmall = d), "-", format(round(max(x), d), nsmall = d))
+  t1 <- do.call(rbind, lapply(split(sim6, list(sim6$n_years, sim6$n, sim6$heaping), drop = TRUE), function(d) data.frame(
+    n_years = d$n_years[1], n_per_year = d$n[1], heaping = d$heaping[1], true_index = round(mean(d$target), 2),
+    classical_range = rng(d$classical_mean, 2), smooth_surface_range = rng(d$smooth_mean, 2),
+    adjusted_mean = round(mean(d$adjusted_mean), 3), bias_range = rng(d$bias), rmse_max = round(max(d$rmse), 3),
+    coverage_range = rng(d$coverage_testbased, 2),
+    reject_score_range = rng(d$reject_score, 3), reject_wild_range = rng(d$reject_wild, 3),
+    reject_wald_range = rng(d$reject_wald, 3))))
+  t1 <- t1[order(t1$n_years, t1$n_per_year, t1$heaping), ]
+  write.csv(t1, file.path(out_dir, "step06_table1_simulation.csv"), row.names = FALSE)
+  print(t1, row.names = FALSE)
+  thr <- do.call(rbind, lapply(split(sim6[sim6$heaping == 0, ], list(sim6$n_years[sim6$heaping == 0],
+                                     sim6$n[sim6$heaping == 0]), drop = TRUE), function(d) data.frame(
+    n_years = d$n_years[1], n_per_year = d$n[1],
+    noise_threshold_median_over_populations = round(median(d$q95_adjusted), 3),
+    noise_threshold_max_over_populations = round(max(d$q95_adjusted), 3))))
+  write.csv(thr, file.path(out_dir, "step06_noise_thresholds.csv"), row.names = FALSE)
+  print(thr, row.names = FALSE)
+  save_fig("step06_fig2_simulation", function() {
+    d <- sim6[sim6$n_years == 18, ]; ns <- sort(unique(d$n))
+    bases <- unique(d$base); pc <- c(15, 16, 17, 18, 8)[seq_along(bases)]
+    par(mfrow = c(1, length(ns)), mar = c(4.5, 4.5, 2, 0.5))
+    for (nn in ns) {
+      z0 <- d[d$n == nn, ]
+      plot(NA, xlim = c(0, 4.8), ylim = c(0, 4.8), xlab = "True index", ylab = "Estimated index",
+           main = paste0("n = ", format(nn, big.mark = ",", scientific = FALSE)), cex.main = 0.9)
+      abline(0, 1, lty = 2)
+      for (k in seq_along(bases)) {
+        z <- z0[z0$base == bases[k], ]
+        points(z$target, z$classical_mean, pch = pc[k], col = "#c0392b")
+        points(z$target, z$smooth_mean, pch = pc[k], col = "#d68910")
+        points(z$target, z$adjusted_mean, pch = pc[k], col = "#2471a3")
+      }
+      if (nn == ns[1]) legend("topleft", c("Classical Myers", "Smooth surface", "Cohort-adjusted", bases),
+                              col = c("#c0392b", "#d68910", "#2471a3", rep("grey30", length(bases))),
+                              pch = c(16, 16, 16, pc), bty = "n", cex = 0.65)
+    }
+  }, w = 9, h = 3.6)
+  cat("step06 finished. Files are in:", out_dir, "\n")
+} else cat("Simulation not complete yet:", nrow(sim6), "of", nrow(sim6_settings),
+           "settings done. Run the script again to continue.\n")
+# =====================================================================
+# STEP 07  (robustness with the Poisson estimator, final figures/tables)
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 19. Robustness of the final estimator: spline flexibility and time window
+#     (Table 5; a fixed seed per unit makes the simulation-based corrections
+#      reproducible)
+# ---------------------------------------------------------------------
+rob7_file <- file.path(out_dir, "step07_robustness_poisson.csv")
+if (!file.exists(rob7_file)) {
+  variants <- list(df6 = list(df = 6, last = Inf), df12 = list(df = 12, last = Inf),
+                   last10yrs = list(df = 8, last = 10))
+  rows <- list()
+  for (vn in names(variants)) {
+    v <- variants[[vn]]
+    out <- lapply(seq_along(fin$geo), function(k) {
+      set.seed(2026 + k)                                   # reproducible draws for each unit
+      g <- fin$geo[k]
+      yrs <- sort(unique(eu2$year[eu2$geo == g]))
+      yrs <- tail(yrs, min(length(yrs), v$last))
+      fit_unit_pois(g, df = v$df, years = yrs, B = 300)
+    })
+    d <- do.call(rbind, out); d$variant <- vn
+    rows[[vn]] <- d[, c("variant", "geo", "index_corrected")]
+    cat("Robustness (Poisson) done:", vn, "\n")
+  }
+  rob7 <- do.call(rbind, rows)
+  write.csv(rob7, rob7_file, row.names = FALSE)
+} else rob7 <- read.csv(rob7_file)
+
+rob7_all <- rbind(rob7, data.frame(variant = ages_res$range, geo = ages_res$geo,
+                                   index_corrected = ages_res$index_corrected))
+rob7_sum <- do.call(rbind, lapply(split(rob7_all, rob7_all$variant), function(d) {
+  b <- fin$index_corrected[match(d$geo, fin$geo)]; k <- !is.na(b)
+  data.frame(variant = d$variant[1], n_units = sum(k),
+             spearman_with_main = round(cor(d$index_corrected[k], b[k], method = "spearman"), 2),
+             median_abs_change = round(median(abs(d$index_corrected[k] - b[k])), 3),
+             median_index = round(median(d$index_corrected[k]), 3),
+             units_above_0.5 = paste(sort(d$geo[d$index_corrected > 0.5]), collapse = " "),
+             top10_overlap = length(intersect(head(d$geo[order(-d$index_corrected)], 10),
+                                              head(fin$geo[order(-fin$index_corrected)], 10))))
+}))
+write.csv(rob7_sum, file.path(out_dir, "step07_table_robustness.csv"), row.names = FALSE)
+print(rob7_sum, row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 20. Digit effects (Poisson, cluster-robust 95% intervals) for selected units
+#     (Figure 4)
+# ---------------------------------------------------------------------
+sel7_file <- file.path(out_dir, "step07_digit_effects_selected.csv")
+if (!file.exists(sel7_file)) {
+  sel7 <- do.call(rbind, lapply(sel_geos[sel_geos %in% eu2$geo], function(g) {
+    m <- fit_digit_pois(eu2[eu2$geo == g & eu2$age %in% main_ages, ])
+    se <- sqrt(pmax(diag(m$Vc), 0))
+    data.frame(geo = g, digit = 0:9, effect_pct = 100 * (exp(m$dc) - 1),
+               low_pct = 100 * (exp(m$dc - 1.96 * se) - 1), high_pct = 100 * (exp(m$dc + 1.96 * se) - 1))
+  }))
+  write.csv(sel7, sel7_file, row.names = FALSE)
+} else sel7 <- read.csv(sel7_file)
+
+# ---------------------------------------------------------------------
+# 21. Figures 3, 4 and S2 (PDF + 1600 dpi PNG, no titles); the file names keep
+#     the numbering of an earlier draft (fig5 = Figure 4, figS1 = Figure S2)
+# ---------------------------------------------------------------------
+save_fig("step07_fig3_classical_vs_adjusted", function() {
+  par(mar = c(4.5, 4.5, 1, 1))
+  y <- pmax(fin$index_corrected, 0.003)
+  plot(fin$raw_myers_mean, y, log = "xy", pch = 19, cex = 0.7,
+       col = adjustcolor(lvl_col[fin$level], 0.6), xlim = c(0.2, 4.5), ylim = c(0.003, 4.5),
+       xlab = "Classical Myers index (mean over years)", ylab = "Cohort-adjusted index")
+  abline(0, 1, lty = 2)
+  lab <- fin$geo %in% c("FRY5", "RO32", "RO", "TRA1", "TR90", "DE", "UKI3")
+  text(fin$raw_myers_mean[lab], y[lab], fin$geo[lab], pos = 4, cex = 0.7)
+  legend("topleft", c("Country", "NUTS1", "NUTS2", "y = x"), pch = c(19, 19, 19, NA),
+         lty = c(NA, NA, NA, 2), col = c(lvl_col, "black"), bty = "n", cex = 0.8)
+})
+
+# Additional figure (NUTS 2 regions of Turkiye), not used in the article
+save_fig("step07_fig4_turkiye", function() {
+  d <- fin[grepl("^TR", fin$geo) & fin$level == "NUTS2", ]
+  d <- d[order(d$index_corrected), ]; k <- nrow(d)
+  par(mar = c(4.5, 4.5, 1, 1))
+  plot(NA, xlim = c(0, max(d$raw_myers_mean) * 1.05), ylim = c(1, k), yaxt = "n",
+       xlab = "Index value", ylab = "")
+  axis(2, at = 1:k, labels = d$geo, las = 1, cex.axis = 0.65)
+  segments(d$ci_low_tb, 1:k, d$ci_high, 1:k, col = "#2471a3")
+  points(d$index_corrected, 1:k, pch = 16, col = "#2471a3")
+  points(d$raw_myers_mean, 1:k, pch = 4, col = "#c0392b")
+  legend("bottomright", c("Classical Myers", "Cohort-adjusted (95% interval)"),
+         pch = c(4, 16), col = c("#c0392b", "#2471a3"), bty = "n", cex = 0.8)
+}, h = 6)
+
+save_fig("step07_fig5_digit_effects", function() {
+  gs <- unique(sel7$geo)
+  par(mfrow = c(2, ceiling(length(gs) / 2)), mar = c(4, 4, 2, 0.5))
+  for (g in gs) {
+    z <- sel7[sel7$geo == g, ]
+    plot(z$digit, z$effect_pct, pch = 16, ylim = range(c(z$low_pct, z$high_pct, -1, 1)), xaxt = "n",
+         xlab = "Terminal digit of age", ylab = "Excess (%)", main = g, cex.main = 0.9)
+    axis(1, at = 0:9); segments(z$digit, z$low_pct, z$digit, z$high_pct); abline(h = 0, lty = 2)
+  }
+}, w = 8, h = 5)
+
+
+save_fig("step07_figS1_age_range", function() {
+  par(mar = c(4.5, 4.5, 1, 1))
+  a <- ages_res[ages_res$range == "ages10_89", ]
+  x <- pmax(a$index_corrected, 0.003); y <- pmax(fin$index_corrected[match(a$geo, fin$geo)], 0.003)  # zeros at axis limit
+  lv <- fin$level[match(a$geo, fin$geo)]
+  plot(x, y, log = "xy", pch = 19, cex = 0.7, col = adjustcolor(lvl_col[lv], 0.6),
+       xlim = c(0.003, 3), ylim = c(0.003, 3),
+       xlab = "Cohort-adjusted index, ages 10-89", ylab = "Cohort-adjusted index, ages 23-72")
+  abline(0, 1, lty = 2)
+  lab <- a$geo %in% c("FRY5", "RO", "NL11", "TRA1", "TR21", "UKI6", "UKI7")  # units discussed in the text
+  text(x[lab], y[lab], a$geo[lab], pos = ifelse(x[lab] > 1.5, 2, 4), cex = 0.65)  # left of points near the edge
+  legend("topleft", c("Country", "NUTS1", "NUTS2", "y = x"), pch = c(19, 19, 19, NA),
+         lty = c(NA, NA, NA, 2), col = c(lvl_col, "black"), bty = "n", cex = 0.8)
+})
+cat("step07 finished. Files are in:", out_dir, "\n")
+
+# =====================================================================
+# STEP 08  (additional analyses: Romania table with the final procedure,
+#           two-way clustered score test, multiple testing, comparison on
+#           the same age range, numerical check of Condition 2, data-driven
+#           spline flexibility, simulation with dependence and other digit
+#           patterns)
+# =====================================================================
+suppressMessages(library(MASS))                            # ginv() for generalised inverses
+
+# ---------------------------------------------------------------------
+# 22. Romania: national series by year subset, with the final procedure
+#     (the all-years row is taken from the final application, so that it is
+#      identical to Table 3 and Table S5; Table S6)
+# ---------------------------------------------------------------------
+ro8_file <- file.path(out_dir, "step08_romania_common_years.csv")
+if (!file.exists(ro8_file)) {
+  yrs_nat <- sort(unique(eu2$year[eu2$geo == "RO"]))       # years of the national series
+  yrs_reg <- sort(unique(eu2$year[eu2$geo == "RO32"]))     # years of the regional series
+  fit_ro <- function(yrs, seed) {                          # final procedure on a subset of years
+    set.seed(seed)                                         # reproducible draws
+    s <- eu2[eu2$geo == "RO" & eu2$age %in% main_ages & eu2$year %in% yrs, ]
+    s <- s[order(s$year, s$age), ]                         # cells ordered by year, then age
+    dz <- build_design(main_ages, unique(s$year))          # design for these years
+    infer_digit(s$value, dz, B_draw = 1000, B_wild = 999)  # index, interval, tests
+  }
+  nm <- c("index", "noise_floor", "index_corrected", "ci_low", "ci_high", "wald", "p_wald",
+          "excess_digit0_pct", "excess_digit5_pct", "score", "p_score", "p_wild", "ci_low_tb")
+  r_all <- unlist(fin[fin$geo == "RO", nm])                # all years: values of the final application
+  r_com <- fit_ro(intersect(yrs_nat, yrs_reg), 2026)       # years with regional data
+  r_not <- fit_ro(setdiff(yrs_nat, yrs_reg), 2027)         # years without regional data
+  ro8 <- data.frame(series = c("national, all years", "national, regional years only",
+                               "national, years without regional data"),
+                    n_years = c(length(yrs_nat), length(intersect(yrs_nat, yrs_reg)),
+                                length(setdiff(yrs_nat, yrs_reg))),
+                    rbind(r_all, r_com, r_not), row.names = NULL)
+  write.csv(ro8, ro8_file, row.names = FALSE)
+} else ro8 <- read.csv(ro8_file)
+print(ro8[, c("series", "n_years", "index_corrected", "ci_low_tb", "ci_high", "p_score")], row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 23. Score test with two-way clustering (cohort and year)
+#     V = V_cohort + V_year - V_cell (Cameron, Gelbach and Miller), with
+#     negative eigenvalues set to zero. The variance is computed from the
+#     residuals of the model with digit effects: with year clusters, the
+#     residuals of the restricted model would contain the digit pattern of
+#     every year and the test would lose its power. With few years this
+#     test over-rejects in the simulation (section 27), so it is reported
+#     only as a check and not used for inference.
+# ---------------------------------------------------------------------
+score_twoway <- function(y, dz) {
+  na <- c(score_2way = NA, p_2way = NA)
+  f0 <- pois_fit(y, dz$X0); f1 <- pois_fit(y, dz$X1)       # models without and with digit effects
+  if (is.null(f0) || is.null(f1)) return(na)
+  mu0 <- f0$fitted.values; X0 <- dz$X0                     # fitted counts and design under H0
+  A <- solve(crossprod(X0, X0 * mu0), crossprod(X0, dz$D * mu0))  # projection on nuisance terms
+  Dt <- dz$D - X0 %*% A                                    # digit columns purged of nuisance terms
+  S <- colSums(Dt * (y - mu0))                             # score (9 digit contrasts) under H0
+  U <- Dt * (y - f1$fitted.values)                         # cell contributions for the variance
+  Vc <- crossprod(rowsum(U, dz$grid$cohort))               # cohort clusters
+  Vy <- crossprod(rowsum(U, dz$grid$year))                 # year clusters
+  V0 <- crossprod(U)                                       # cell level (intersection of the two)
+  ev <- eigen(Vc + Vy - V0, symmetric = TRUE)              # two-way variance
+  V2 <- ev$vectors %*% diag(pmax(ev$values, 0)) %*% t(ev$vectors)  # make it positive semi-definite
+  Vi <- tryCatch(solve(V2), error = function(e) ginv(V2))  # Route A: solve, Route B: ginv
+  T2 <- as.numeric(t(S) %*% Vi %*% S)
+  c(score_2way = T2, p_2way = pchisq(T2, 9, lower.tail = FALSE))
+}
+
+# ---------------------------------------------------------------------
+# 24. Comparison on the same age range (ages 23-72): a model without
+#     cohort effects (smooth age + year + digit), on the same index scale
+# ---------------------------------------------------------------------
+nocohort_index <- function(y, dz) {
+  X <- model.matrix(~ ns(age, 8) + factor(year) + digit, dz$grid)  # no cohort effects
+  f <- pois_fit(y, X)
+  if (is.null(f)) return(NA)
+  b <- f$coefficients[paste0("digit", 1:9)]                # digit effects relative to digit 0
+  if (any(is.na(b))) return(NA)
+  digit_index(c(0, b) - mean(c(0, b)))                     # index on the Myers scale
+}
+
+unit8_file <- file.path(out_dir, "step08_units_inference.csv")
+if (!file.exists(unit8_file)) {
+  out <- list()
+  for (k in seq_along(fin$geo)) {
+    g <- fin$geo[k]
+    s <- eu2[eu2$geo == g & eu2$age %in% main_ages, ]
+    s <- s[order(s$year, s$age), ]                         # cells ordered by year, then age
+    dz <- build_design(main_ages, unique(s$year))
+    out[[g]] <- data.frame(geo = g, t(score_twoway(s$value, dz)),
+                           nocohort_index = nocohort_index(s$value, dz))
+    if (k %% 50 == 0) cat("Two-way tests and comparison index:", k, "of", nrow(fin), "\n")
+  }
+  u8 <- do.call(rbind, out)
+  u8 <- merge(fin[, c("geo", "level", "n_years", "mean_pop_10_89", "raw_myers_mean",
+                      "smooth_surface_index", "index", "index_corrected", "p_score", "p_wild")], u8, by = "geo")
+  u8$p_score_bh <- p.adjust(u8$p_score, method = "BH")     # false discovery rate (Benjamini-Hochberg)
+  u8$p_2way_bh  <- p.adjust(u8$p_2way, method = "BH")
+  write.csv(u8, unit8_file, row.names = FALSE)
+} else u8 <- read.csv(unit8_file)
+
+sum_inf <- function(d, lab) data.frame(
+  level = lab, n_units = nrow(d),
+  reject_score = mean(d$p_score < 0.05),                   # one-way score test (main analysis)
+  reject_wild = mean(d$p_wild < 0.05),                     # its wild bootstrap version
+  agree_score_wild = mean((d$p_score < 0.05) == (d$p_wild < 0.05)),  # same decision
+  reject_2way = mean(d$p_2way < 0.05, na.rm = TRUE),       # two-way clustered score test
+  reject_score_bh = mean(d$p_score_bh < 0.05),             # after FDR control
+  reject_2way_bh = mean(d$p_2way_bh < 0.05, na.rm = TRUE),
+  median_classical_10_89 = median(d$raw_myers_mean),       # classical Myers, ages 10-89
+  median_nocohort_23_72 = median(d$nocohort_index, na.rm = TRUE),      # same range, no cohorts
+  median_smooth_23_72 = median(d$smooth_surface_index, na.rm = TRUE),  # same range, smooth surface
+  median_adjusted_plugin = median(d$index),                # cohort-adjusted, before bias correction
+  median_adjusted = median(d$index_corrected),             # cohort-adjusted, bias-corrected
+  spearman_classical_nocohort = cor(d$raw_myers_mean, d$nocohort_index, method = "spearman",
+                                    use = "complete.obs"),
+  spearman_nocohort_adjusted = cor(d$nocohort_index, d$index_corrected, method = "spearman",
+                                   use = "complete.obs"))
+inf8 <- rbind(do.call(rbind, lapply(split(u8, u8$level), function(d) sum_inf(d, d$level[1]))),
+              sum_inf(u8, "all"))                          # by level and for all units
+write.csv(inf8, file.path(out_dir, "step08_units_summary.csv"), row.names = FALSE)
+print(inf8, row.names = FALSE, digits = 3)
+
+# ---------------------------------------------------------------------
+# 25. Numerical check of Condition 2 for the spline bases used (Table S2)
+#     (k = 1 for every unit). The condition holds when the space of first
+#     differences of the age function and the space of 10-periodic
+#     sequences share only the constants. The largest canonical
+#     correlation between the two spaces (constants removed) measures how
+#     close the design is to weak identification (1 = not identified).
+# ---------------------------------------------------------------------
+cond2_file <- file.path(out_dir, "step08_condition2_check.csv")
+if (!file.exists(cond2_file)) {
+  ranges <- list(`23-72` = 23:72, `20-79` = 20:79, `25-69` = 25:69, `30-79` = 30:79, `10-89` = 10:89)
+  rows <- list()
+  for (rn in names(ranges)) for (df in c(6, 8, 12)) {
+    a <- ranges[[rn]]
+    Bs <- cbind(a, ns(a, df = df))                         # linear term plus natural spline basis
+    dB <- Bs[-1, , drop = FALSE] - Bs[-nrow(Bs), , drop = FALSE]  # first differences f(a+1) - f(a)
+    P <- outer(a[-length(a)] %% 10, 0:9, "==") * 1         # 10-periodic sequences on A_1
+    cen <- function(M) scale(M, scale = FALSE)             # remove the constant component
+    r_dB <- qr(dB)$rank; r_P <- qr(P)$rank
+    dim_common <- r_dB + r_P - qr(cbind(dB, P))$rank       # dimension of the intersection
+    Q1 <- qr.Q(qr(cen(dB)))[, seq_len(qr(cen(dB))$rank), drop = FALSE]  # orthonormal basis, no constants
+    Q2 <- qr.Q(qr(cen(P)))[, seq_len(qr(cen(P))$rank), drop = FALSE]
+    rows[[length(rows) + 1]] <- data.frame(age_range = rn, df = df,
+      dim_intersection = dim_common,                       # 1 = only constants: Condition 2 holds
+      condition2_holds = dim_common == 1,
+      max_canonical_correlation = max(svd(t(Q1) %*% Q2)$d))  # below 1 = identified; near 1 = weak
+  }
+  cond2 <- do.call(rbind, rows)
+  write.csv(cond2, cond2_file, row.names = FALSE)
+} else cond2 <- read.csv(cond2_file)
+print(cond2, row.names = FALSE)
+
+# ---------------------------------------------------------------------
+# 26. Data-driven flexibility of the age function: degrees of freedom
+#     chosen for each unit by QAIC (overdispersion from the most flexible fit;
+#     Table 5). QAIC often chooses ten or more degrees of freedom, where the
+#     digit effects are close to unidentified (section 29).
+# ---------------------------------------------------------------------
+qaic_file <- file.path(out_dir, "step08_df_qaic.csv")
+if (!file.exists(qaic_file)) {
+  df_grid <- 4:14                                          # candidate degrees of freedom
+  out <- list()
+  for (k in seq_along(fin$geo)) {
+    set.seed(2026 + k)                                     # reproducible draws for each unit
+    g <- fin$geo[k]
+    s <- eu2[eu2$geo == g & eu2$age %in% main_ages, ]; s <- s[order(s$year, s$age), ]
+    fits <- lapply(df_grid, function(df) pois_fit(s$value, build_design(main_ages, unique(s$year), df)$X1))
+    big <- fits[[length(fits)]]                            # most flexible model
+    if (is.null(big)) next
+    chat <- sum((s$value - big$fitted.values)^2 / big$fitted.values) / big$df.residual  # dispersion
+    qaic <- sapply(fits, function(f) if (is.null(f)) NA else f$deviance / chat + 2 * f$rank)  # QAIC
+    df_best <- df_grid[which.min(qaic)]
+    dz <- build_design(main_ages, unique(s$year), df_best)
+    r <- infer_digit(s$value, dz, B_draw = 300, B_wild = 99)  # index with the chosen flexibility
+    out[[g]] <- data.frame(geo = g, df_qaic = df_best, index_corrected_qaic = r[["index_corrected"]])
+    if (k %% 50 == 0) cat("QAIC selection:", k, "of", nrow(fin), "\n")
+  }
+  qa <- do.call(rbind, out)
+  write.csv(qa, qaic_file, row.names = FALSE)
+} else qa <- read.csv(qaic_file)
+b <- fin$index_corrected[match(qa$geo, fin$geo)]           # main-analysis values (8 df)
+qaic_sum <- data.frame(n_units = nrow(qa), median_df = median(qa$df_qaic),
+  share_df_6_to_10 = mean(qa$df_qaic >= 6 & qa$df_qaic <= 10),
+  spearman_with_main = round(cor(qa$index_corrected_qaic, b, method = "spearman"), 2),
+  median_abs_change = round(median(abs(qa$index_corrected_qaic - b)), 3),
+  median_index = round(median(qa$index_corrected_qaic), 3),
+  units_above_0.5 = paste(sort(qa$geo[qa$index_corrected_qaic > 0.5]), collapse = " "))
+write.csv(qaic_sum, file.path(out_dir, "step08_df_qaic_summary.csv"), row.names = FALSE)
+print(qaic_sum, row.names = FALSE)
+print(table(qa$df_qaic))
+
+# ---------------------------------------------------------------------
+# 27. Simulation with dependence and with other digit patterns
+#     (long: about 1-2 hours; progress is saved after every setting and
+#      the simulation resumes where it stopped)
+#     (Table S4)
+#     Dependence (no extra digit pattern, heaping on 0 and 5):
+#       year_shock : in every year a transient bump of the age distribution
+#                    (normal amplitude with sd 3%, random centre, width with
+#                    sd 4 years) that is not
+#                    carried forward, so it affects several cohorts at once
+#       cohort_ar  : cohort-specific deviations that persist over years
+#                    (AR(1), rho = 0.7, innovation sd 0.02)
+#     Digit patterns (independent sampling, h = 0.01):
+#       zero_only, zero_gt_five (ages nearest to 5 move with half the share),
+#       two_eight (heaping on ages ending in 2 or 8),
+#       time_varying (heaping on 0 and 5, share rising linearly over the
+#                     observation years from h/2 to 3h/2)
+# ---------------------------------------------------------------------
+heap_map <- function(pattern) {                            # target age and weight for each age 10-89
+  tg <- rep(NA, length(myers_ages)); wt <- rep(1, length(myers_ages))
+  for (i in seq_along(myers_ages)) {
+    a <- myers_ages[i]
+    cand <- switch(pattern,                                # ages that attract misreports
+      zero_only = seq(10, 90, 10),
+      two_eight = sort(c(seq(12, 82, 10), seq(18, 88, 10))),
+      seq(10, 90, 5))                                      # default: ages ending in 0 or 5
+    cand <- cand[cand >= 10 & cand <= 89]
+    if (a %in% cand) next                                  # attracting ages keep their persons
+    tg[i] <- cand[which.min(abs(cand - a))]                # nearest attracting age (lower on ties)
+    if (pattern == "zero_gt_five" && tg[i] %% 10 == 5) wt[i] <- 0.5  # weaker attraction of 5
+  }
+  list(tg = tg, wt = wt)
+}
+heap_pattern <- function(x, h, hm) {                       # expected counts after heaping
+  new <- x
+  for (i in which(!is.na(hm$tg))) {
+    k <- h * hm$wt[i] * x[i]                               # persons moving from age i
+    new[i] <- new[i] - k; new[hm$tg[i] - 9] <- new[hm$tg[i] - 9] + k
+  }
+  new
+}
+
+sim8_prog <- file.path(out_dir, "step08_sim_progress.csv")
+sim8_settings <- rbind(
+  expand.grid(scenario = c("year_shock", "cohort_ar"), heaping = c(0, 0.01), n = 1e5,
+              n_years = c(8, 18), base = c("DE", "RO", "PL", "EL", "TR"), R = 400, stringsAsFactors = FALSE),
+  expand.grid(scenario = c("zero_only", "zero_gt_five", "two_eight", "time_varying"), heaping = 0.01,
+              n = 1e5, n_years = c(8, 18), base = c("DE", "RO", "PL", "EL", "TR"), R = 200,
+              stringsAsFactors = FALSE))
+sim8_settings$id <- seq_len(nrow(sim8_settings))
+done8 <- if (file.exists(sim8_prog)) read.csv(sim8_prog)$id else integer(0)
+todo8 <- sim8_settings[!sim8_settings$id %in% done8, ]
+cat("Step 08 simulation settings remaining:", nrow(todo8), "of", nrow(sim8_settings), "\n")
+
+base8 <- list()
+for (k in seq_len(nrow(todo8))) {
+  st <- todo8[k, ]
+  set.seed(3026 + st$id)                                   # reproducible, also after a restart
+  key <- paste(st$base, st$n_years)
+  if (is.null(base8[[key]])) {                             # cohort structure without digit preference
+    s_all <- eu2[eu2$geo == st$base & eu2$year >= 2008, ]
+    yrs <- tail(sort(unique(s_all$year)), st$n_years)
+    s0 <- s_all[s_all$year %in% yrs, ]; s0 <- s0[order(s0$year, s0$age), ]
+    m0 <- fit_digit_pois(s0[s0$age %in% main_ages, ])
+    s0$value <- s0$value * exp(-m0$dc[s0$age %% 10 + 1])
+    base8[[key]] <- list(s0 = s0, yrs = yrs, dz = build_design(main_ages, yrs))
+  }
+  s0 <- base8[[key]]$s0; yrs <- base8[[key]]$yrs; dz <- base8[[key]]$dz
+  pat <- if (st$scenario %in% c("zero_only", "zero_gt_five", "two_eight")) st$scenario else "zero_five"
+  hm <- heap_map(pat)
+  h_year <- if (st$scenario == "time_varying")             # heaping share in each year
+    st$heaping * seq(0.5, 1.5, length.out = length(yrs)) else rep(st$heaping, length(yrs))
+  lam <- mapply(function(v, h) heap_pattern(v, h, hm), split(s0$value, s0$year), h_year,
+                SIMPLIFY = FALSE)                          # expected heaped counts per year
+  in_main <- myers_ages %in% main_ages
+  y_pop <- unlist(lapply(lam, function(v) v[in_main]))
+  target <- if (st$heaping == 0) 0 else {                  # estimand: fit to expected heaped counts
+    f <- pois_fit(y_pop, dz$X1); b <- f$coefficients[dz$di1]; digit_index(c(0, b) - mean(c(0, b)))
+  }
+  res <- matrix(NA, st$R, 7)
+  for (r in seq_len(st$R)) {
+    eps <- matrix(0, length(myers_ages), length(yrs))      # log-scale perturbation (age x year)
+    if (st$scenario == "year_shock") for (j in seq_along(yrs)) {
+      ctr <- runif(1, 20, 65)                              # centre of this year's bump
+      eps[, j] <- 0.03 * rnorm(1) * exp(-(myers_ages - ctr)^2 / (2 * 4^2))
+    }
+    if (st$scenario == "cohort_ar") {
+      coh <- outer(myers_ages, yrs, function(a, t) t - a)  # cohort of each cell
+      cs <- sort(unique(as.vector(coh)))
+      e <- matrix(0, length(cs), length(yrs))              # AR(1) path for each cohort
+      e[, 1] <- rnorm(length(cs), 0, 0.02 / sqrt(1 - 0.7^2))
+      for (j in seq_along(yrs)[-1]) e[, j] <- 0.7 * e[, j - 1] + rnorm(length(cs), 0, 0.02)
+      for (j in seq_along(yrs)) eps[, j] <- e[match(coh[, j], cs), j]
+    }
+    smp <- lapply(seq_along(lam), function(j)              # n persons aged 10-89 per year
+      as.vector(rmultinom(1, st$n, lam[[j]] * exp(eps[, j]))))
+    raw <- mean(sapply(smp, myers_index))                  # classical Myers
+    y <- unlist(lapply(smp, function(v) v[in_main]))       # ages 23-72 for the models
+    a1 <- infer_digit(y, dz, B_draw = 300, B_wild = 199)
+    if (is.null(a1)) next
+    a2 <- score_twoway(y, dz)
+    res[r, ] <- c(raw, a1[["index_corrected"]], a1[["ci_low_tb"]], a1[["ci_high"]],
+                  a1[["p_score"]], a1[["p_wild"]], a2[["p_2way"]])
+  }
+  ok <- !is.na(res[, 2])
+  row <- data.frame(id = st$id, scenario = st$scenario, base = st$base, n_years = st$n_years, n = st$n,
+    heaping = st$heaping, R = sum(ok), target = target,
+    classical_mean = mean(res[ok, 1]), adjusted_mean = mean(res[ok, 2]),
+    bias = mean(res[ok, 2]) - target, rmse = sqrt(mean((res[ok, 2] - target)^2)),
+    coverage_testbased = mean(res[ok, 3] <= target & target <= res[ok, 4]),
+    reject_score = mean(res[ok, 5] < 0.05), reject_wild = mean(res[ok, 6] < 0.05),
+    reject_2way = mean(res[ok, 7] < 0.05, na.rm = TRUE))
+  write.table(row, sim8_prog, sep = ",", row.names = FALSE,
+              col.names = !file.exists(sim8_prog), append = file.exists(sim8_prog))
+  cat(format(Sys.time(), "%H:%M"), "step 08 setting", st$id, "of", nrow(sim8_settings),
+      "done (", st$scenario, st$base, st$n_years, "years, h =", st$heaping, ")\n")
+}
+
+sim8 <- read.csv(sim8_prog)
+if (nrow(sim8) == nrow(sim8_settings)) {
+  rng <- function(x, d = 3) paste(format(round(min(x), d), nsmall = d), "-", format(round(max(x), d), nsmall = d))
+  t8 <- do.call(rbind, lapply(split(sim8, list(sim8$scenario, sim8$n_years, sim8$heaping), drop = TRUE),
+    function(d) data.frame(scenario = d$scenario[1], n_years = d$n_years[1], heaping = d$heaping[1],
+      true_index = round(mean(d$target), 2), classical_range = rng(d$classical_mean, 2),
+      adjusted_mean = round(mean(d$adjusted_mean), 3), bias_range = rng(d$bias),
+      rmse_max = round(max(d$rmse), 3), coverage_range = rng(d$coverage_testbased, 2),
+      reject_score_range = rng(d$reject_score), reject_wild_range = rng(d$reject_wild),
+      reject_2way_range = rng(d$reject_2way))))
+  t8 <- t8[order(t8$scenario, t8$heaping, t8$n_years), ]
+  write.csv(sim8[order(sim8$scenario, sim8$base, sim8$n_years, sim8$heaping), ],
+            file.path(out_dir, "step08_sim_by_population.csv"), row.names = FALSE)
+  write.csv(t8, file.path(out_dir, "step08_table_simulation.csv"), row.names = FALSE)
+  print(t8, row.names = FALSE)
+  cat("step08 finished. Files are in:", out_dir, "\n")
+} else cat("Step 08 simulation not complete yet:", nrow(sim8), "of", nrow(sim8_settings),
+           "settings done. Run the script again to continue.\n")
+
+# =====================================================================
+# STEP 09  (decomposition of the difference between the classical and the
+#           cohort-adjusted index on the same age range, and weak
+#           identification as a function of the spline flexibility)
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 28. Cross-sectional counterpart on ages 23-72: for every unit and year a
+#     model with a smooth age function and digit effects is fitted to that
+#     single year; the index is averaged over years, as the classical index.
+#     Together with the pooled model without cohort effects (step08), the
+#     smooth-surface model and the cohort-adjusted model, this separates
+#     the effect of the age range from that of using repeated distributions
+#     (Table 4).
+# ---------------------------------------------------------------------
+cs_digit_index <- function(v, ages = main_ages, df_age = 8) {  # one year, one unit
+  d <- data.frame(value = v, age = ages, digit = factor(ages %% 10, levels = 0:9))
+  X <- model.matrix(~ ns(age, df_age) + digit, d)          # smooth age curve + digit effects
+  f <- pois_fit(d$value, X)                                # Route A / Route B inside pois_fit
+  if (is.null(f)) return(NA)
+  b <- f$coefficients[paste0("digit", 1:9)]
+  if (any(is.na(b))) return(NA)
+  digit_index(c(0, b) - mean(c(0, b)))                     # index on the Myers scale
+}
+
+cs9_file <- file.path(out_dir, "step09_cross_section_23_72.csv")
+if (!file.exists(cs9_file)) {
+  out <- list()
+  for (k in seq_along(fin$geo)) {
+    g <- fin$geo[k]
+    s <- eu2[eu2$geo == g & eu2$age %in% main_ages, ]; s <- s[order(s$year, s$age), ]
+    idx <- sapply(split(s$value, s$year), cs_digit_index)  # one index per year
+    out[[g]] <- data.frame(geo = g, cross_section_mean = mean(idx, na.rm = TRUE),
+                           cross_section_min = min(idx, na.rm = TRUE),
+                           cross_section_max = max(idx, na.rm = TRUE))
+    if (k %% 100 == 0) cat("Cross-sectional fits:", k, "of", nrow(fin), "\n")
+  }
+  cs9 <- do.call(rbind, out)
+  write.csv(cs9, cs9_file, row.names = FALSE)
+} else cs9 <- read.csv(cs9_file)
+
+dec <- merge(u8[, c("geo", "level", "raw_myers_mean", "nocohort_index", "smooth_surface_index",
+                    "index", "index_corrected")], cs9, by = "geo")
+dec$turkiye_nuts2 <- grepl("^TR", dec$geo) & dec$level == "NUTS2"  # 26 regions of Turkiye (extra row, not in the article)
+sum_dec <- function(d, lab) data.frame(group = lab, n_units = nrow(d),
+  classical_10_89 = median(d$raw_myers_mean),              # classical Myers, ages 10-89, mean over years
+  cross_section_23_72 = median(d$cross_section_mean),      # one year at a time, ages 23-72
+  pooled_nocohort_23_72 = median(d$nocohort_index, na.rm = TRUE),  # all years, no cohort effects
+  smooth_surface_23_72 = median(d$smooth_surface_index, na.rm = TRUE),  # all years, smooth surface
+  adjusted_plugin_23_72 = median(d$index),                 # all years, cohort effects
+  adjusted_corrected_23_72 = median(d$index_corrected),    # the same, bias-corrected
+  spearman_classical_cross_section = cor(d$raw_myers_mean, d$cross_section_mean, method = "spearman"),
+  spearman_cross_section_adjusted = cor(d$cross_section_mean, d$index_corrected, method = "spearman"))
+dec_sum <- rbind(do.call(rbind, lapply(split(dec, dec$level), function(d) sum_dec(d, d$level[1]))),
+                 sum_dec(dec, "all"), sum_dec(dec[dec$turkiye_nuts2, ], "Turkiye NUTS2"))
+write.csv(dec_sum, file.path(out_dir, "step09_decomposition_summary.csv"), row.names = FALSE)
+print(dec_sum, row.names = FALSE, digits = 3)
+
+# ---------------------------------------------------------------------
+# 29. Weak identification by spline flexibility (largest canonical
+#     correlation between first differences of the age function and
+#     10-periodic sequences, constants removed; 1 = not identified; Table S2)
+# ---------------------------------------------------------------------
+wid9_file <- file.path(out_dir, "step09_weak_identification_by_df.csv")
+if (!file.exists(wid9_file)) {
+  ranges <- list(`23-72` = 23:72, `20-79` = 20:79, `25-69` = 25:69, `30-79` = 30:79, `10-89` = 10:89)
+  rows <- list()
+  for (rn in names(ranges)) for (df in 4:14) {
+    a <- ranges[[rn]]
+    Bs <- cbind(a, ns(a, df = df))                         # linear term plus natural spline basis
+    dB <- Bs[-1, , drop = FALSE] - Bs[-nrow(Bs), , drop = FALSE]  # first differences
+    P <- outer(a[-length(a)] %% 10, 0:9, "==") * 1         # 10-periodic sequences
+    cen <- function(M) scale(M, scale = FALSE)             # remove constants
+    q1 <- qr(cen(dB)); q2 <- qr(cen(P))
+    Q1 <- qr.Q(q1)[, seq_len(q1$rank), drop = FALSE]; Q2 <- qr.Q(q2)[, seq_len(q2$rank), drop = FALSE]
+    rows[[length(rows) + 1]] <- data.frame(age_range = rn, df = df,
+      knot_spacing_years = round(length(a) / df, 1),       # average distance between knots
+      max_canonical_correlation = round(max(svd(t(Q1) %*% Q2)$d), 3))
+  }
+  wid9 <- do.call(rbind, rows)
+  write.csv(wid9, wid9_file, row.names = FALSE)
+} else wid9 <- read.csv(wid9_file)
+print(reshape(wid9[, c("age_range", "df", "max_canonical_correlation")], idvar = "df",
+              timevar = "age_range", direction = "wide"), row.names = FALSE)
+cat("step09 finished. Files are in:", out_dir, "\n")
