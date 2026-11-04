@@ -4,7 +4,7 @@ R code to estimate a cohort-adjusted Myers index from repeated single-year age d
 
 ## Data
 
-Eurostat dataset `demo_r_d2jan` (population on 1 January by age, sex and NUTS 2 region). The script downloads it automatically and saves a local copy, so the download happens only once.
+Eurostat dataset `demo_r_d2jan` (population on 1 January by age, sex and NUTS 2 region). The script downloads it automatically and saves a local copy, so the download happens only once. The analysis data (ages 10–89, one row per unit and year) are also provided as `data.csv`.
 
 ## Requirements
 
@@ -26,5 +26,6 @@ Set `base_A` (or `base_B`) in section 0 of the R script to your working folder a
 | 07 | Sensitivity analyses; digit effects; figures |
 | 08 | Additional checks and simulations |
 | 09 | Decomposition of the classical–adjusted difference; weak identification |
+| 10 | Export of the analysis data to `data.csv` |
 
 Step 04 of the development version is not needed. Figures are saved as PDF and 1600 dpi PNG.
