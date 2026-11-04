@@ -20,6 +20,7 @@
 #           with dependence and other digit patterns
 #   step09  decomposition of the classical-adjusted difference on the same
 #           age range; weak identification by spline flexibility
+#   step10  export of the analysis data to data.csv
 #   (step04 of the development version was superseded and is not needed.)
 #
 # Outputs used in the article (all written to the output folder)
@@ -40,6 +41,7 @@
 #   Figure 1  step03_fig1_identifiability       Figure 2  step06_fig2_simulation
 #   Figure 3  step07_fig3_classical_vs_adjusted  Figure 4  step07_fig5_digit_effects
 #   Figure S1 step05_fig_diagnostics            Figure S2 step07_figS1_age_range
+#   Analysis data: data.csv (step 10).
 #   Numbers quoted in the text: step06_summary_final.csv,
 #   step08_units_summary.csv (test rejections, false discovery rate),
 #   step05_age_ranges_summary.csv and step05_time_stability.csv.
@@ -1338,3 +1340,37 @@ if (!file.exists(wid9_file)) {
 print(reshape(wid9[, c("age_range", "df", "max_canonical_correlation")], idvar = "df",
               timevar = "age_range", direction = "wide"), row.names = FALSE)
 cat("step09 finished. Files are in:", out_dir, "\n")
+
+# =====================================================================
+# STEP 10  (export of the analysis data)
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 30. Analysis data as a CSV file (data.csv in the output folder)
+#     Eurostat population on 1 January (dataset demo_r_d2jan), both sexes,
+#     single years of age 10-89, for every unit and year with a complete
+#     series: the data used by steps 02-09. One row per unit and year, one
+#     column per age. Nothing is downloaded again: the data come from the
+#     copy saved in step 01. The file is written only once.
+# ---------------------------------------------------------------------
+data_file <- file.path(out_dir, "data.csv")
+if (!file.exists(data_file)) {
+  key <- paste(eu2$geo, eu2$year, sep = "_")                # one key per unit and year
+  m <- tapply(eu2$value, list(key, eu2$age), sum)          # matrix: unit-year x age
+  id <- unique(eu2[, c("geo", "level", "year")])           # unit, level and year of each row
+  id <- id[order(id$geo, id$year), ]
+  cnt <- m[paste(id$geo, id$year, sep = "_"), as.character(myers_ages), drop = FALSE]  # same order as id
+  colnames(cnt) <- paste0("age_", myers_ages)              # columns age_10 ... age_89
+  dat <- data.frame(id, cnt, row.names = NULL, check.names = FALSE)
+  dat$used_in_analysis <- if (exists("fin")) dat$geo %in% fin$geo else NA  # TRUE for the 502 analysed units
+  ok <- tryCatch({                                         # Route A: data.table::fwrite (fast), if installed
+    if (!requireNamespace("data.table", quietly = TRUE)) stop("data.table not installed")
+    data.table::fwrite(dat, data_file); TRUE
+  }, error = function(e) FALSE)
+  if (!ok) write.csv(dat, data_file, row.names = FALSE)    # Route B: base R
+}
+dat_chk <- read.csv(data_file, nrows = 5, check.names = FALSE)  # quick check of the first rows
+cat("data.csv written:", data_file, "\n")
+cat("Columns:", ncol(dat_chk), "(geo, level, year, age_10 ... age_89, used_in_analysis)\n")
+cat("File size (MB):", round(file.size(data_file) / 1e6, 1), "\n")
+cat("step10 finished. Files are in:", out_dir, "\n")
